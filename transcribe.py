@@ -5,6 +5,7 @@
 #
 # Runs on Windows with NVIDIA CUDA (RTX 3060 12 GB VRAM).
 # Uses scerz/VibeVoice-ASR-4bit (4-bit quantized, ~5-7 GB VRAM).
+# Optionally summarizes transcripts via Gemini 2.5 Flash Lite.
 #
 # Usage examples:
 #   # Single file — prints transcript to console
@@ -13,8 +14,14 @@
 #   # Single file — saves JSON to output\
 #   python transcribe.py --input audio\meeting.mp3 --output-dir output
 #
-#   # Batch transcribe a folder
-#   python transcribe.py --batch audio\ --output-dir output\
+#   # Transcribe AND summarize with Gemini 2.5 Flash Lite
+#   python transcribe.py --input audio\meeting.mp3 --output-dir output --summarize
+#
+#   # Summarize only (skip re-transcribing, use existing JSON)
+#   python transcribe.py --summarize-only output\meeting.json
+#
+#   # Batch transcribe + summarize a folder
+#   python transcribe.py --batch audio\ --output-dir output --summarize
 #
 #   # Add domain-specific hotwords for better accuracy
 #   python transcribe.py --input meeting.mp3 --context "Alice, Bob, Q4 Review"
@@ -29,7 +36,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -58,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "VibeVoice Meeting Transcription App\n"
             "Transcribes audio using scerz/VibeVoice-ASR-4bit on Windows NVIDIA CUDA.\n"
-            "Supports speaker diarization, timestamps, and automatic audio splitting."
+            "Optionally summarizes transcripts via Gemini 2.5 Flash Lite."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -66,11 +75,14 @@ examples:
   # Single file — console output
   python transcribe.py --input audio\\meeting.mp3
 
-  # Single file — save JSON
-  python transcribe.py --input audio\\meeting.mp3 --output-dir output
+  # Single file — save JSON + Gemini summary
+  python transcribe.py --input audio\\meeting.mp3 --output-dir output --summarize
 
-  # Batch transcribe a folder
-  python transcribe.py --batch audio\\ --output-dir output
+  # Summarize an existing transcript JSON (no re-transcription)
+  python transcribe.py --summarize-only output\\meeting.json
+
+  # Batch transcribe + summarize a folder
+  python transcribe.py --batch audio\\ --output-dir output --summarize
 
   # Add domain-specific terms to improve accuracy
   python transcribe.py --input meeting.mp3 --context "Acme Corp, John, Q4"
@@ -80,6 +92,10 @@ examples:
 
   # Check VRAM (no model loading needed)
   python transcribe.py --vram-check
+
+Gemini API key:
+  Set GOOGLE_API_KEY environment variable, or pass --gemini-api-key KEY.
+  Get a free key at: https://aistudio.google.com/apikey
         """,
     )
 
@@ -102,6 +118,13 @@ examples:
         action="store_true",
         help="Display GPU VRAM info and exit (does not load the model).",
     )
+    input_group.add_argument(
+        "--summarize-only",
+        metavar="JSON_FILE",
+        type=Path,
+        help="Skip transcription. Load an existing transcript JSON and "
+             "summarize it with Gemini 2.5 Flash Lite.",
+    )
 
     # --- Output options ---
     parser.add_argument(
@@ -109,13 +132,13 @@ examples:
         metavar="DIR",
         type=Path,
         default=None,
-        help="Directory to save JSON transcription files. "
+        help="Directory to save JSON transcription and summary files. "
              "If omitted, output is printed to console only.",
     )
     parser.add_argument(
         "--no-json",
         action="store_true",
-        help="Do not save JSON files even when --output-dir is specified.",
+        help="Do not save transcript JSON files.",
     )
 
     # --- Model options ---
@@ -139,6 +162,32 @@ examples:
         default=None,
         help="Comma-separated hotwords or context to improve recognition "
              "(e.g., 'Alice Smith, Acme Corp, Q4 Budget').",
+    )
+
+    # --- Gemini summarization options ---
+    summary_group = parser.add_argument_group(
+        "Gemini 2.5 Flash Lite summarization",
+        "Automatically summarize transcripts after transcription. "
+        "Requires a Google AI API key (free tier available).",
+    )
+    summary_group.add_argument(
+        "--summarize", "-s",
+        action="store_true",
+        help="Summarize each transcript with Gemini 2.5 Flash Lite after transcribing.",
+    )
+    summary_group.add_argument(
+        "--gemini-api-key",
+        metavar="KEY",
+        default=None,
+        help="Google AI API key. Overrides GOOGLE_API_KEY env var. "
+             "Get a free key at https://aistudio.google.com/apikey",
+    )
+    summary_group.add_argument(
+        "--summary-format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Format for saved summary files. "
+             "'markdown' → <stem>_summary.md (default), 'json' → <stem>_summary.json",
     )
 
     # --- VRAM / performance options ---
@@ -200,12 +249,6 @@ def cmd_vram_check() -> int:
         )
         return 1
 
-    try:
-        from rich.console import Console
-        console = Console()
-    except ImportError:
-        console = None
-
     device_count = torch.cuda.device_count()
     print(f"\nCUDA Devices: {device_count}")
     for i in range(device_count):
@@ -227,6 +270,109 @@ def cmd_vram_check() -> int:
     return 0
 
 
+def _run_summarization(result, args, logger) -> None:
+    """
+    Summarize a TranscriptionResult with Gemini 2.5 Flash Lite and
+    print / save the output.  Called after each successful transcription.
+    """
+    from meeting_assistant.summarizer import MeetingSummarizer
+
+    try:
+        summarizer = MeetingSummarizer(api_key=args.gemini_api_key)
+    except ValueError as e:
+        logger.error("Summarization skipped: %s", e)
+        return
+
+    logger.info("Summarizing with Gemini 2.5 Flash Lite...")
+    summary = summarizer.summarize(
+        segments=result.segments,
+        total_duration_seconds=result.total_duration_seconds,
+        source_file=str(result.source_file),
+    )
+
+    # Print to console
+    _print_summary(summary)
+
+    # Save to file if output-dir provided
+    if args.output_dir:
+        out_path = summarizer.save(
+            summary=summary,
+            output_dir=args.output_dir,
+            stem=result.source_file.stem,
+            fmt=args.summary_format,
+        )
+        logger.info("Summary saved: %s", out_path)
+
+
+def _print_summary(summary) -> None:
+    """Print a MeetingSummary to the terminal (rich or plain)."""
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.markdown import Markdown
+
+        console = Console()
+        console.print()
+        console.print(Panel(
+            Markdown(summary.to_markdown()),
+            title=f"[bold green]Gemini Summary[/bold green]",
+            subtitle=f"[dim]{summary.model}[/dim]",
+            border_style="green",
+        ))
+    except ImportError:
+        print("\n=== GEMINI SUMMARY ===\n")
+        print(summary.to_markdown())
+        print()
+
+
+def cmd_summarize_only(args, logger) -> int:
+    """Load an existing transcript JSON and summarize it — no GPU needed."""
+    json_path = args.summarize_only
+    if not json_path.exists():
+        print(f"Error: File not found: {json_path}")
+        return 1
+
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    segments = data.get("segments", [])
+    duration = data.get("total_duration_seconds", 0.0)
+    source_name = data.get("source_file", str(json_path))
+
+    if not segments:
+        print(f"Error: No segments found in {json_path}")
+        return 1
+
+    from meeting_assistant.summarizer import MeetingSummarizer
+
+    try:
+        summarizer = MeetingSummarizer(api_key=args.gemini_api_key)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+
+    logger.info("Summarizing %d segments from %s...", len(segments), json_path.name)
+    summary = summarizer.summarize(
+        segments=segments,
+        total_duration_seconds=duration,
+        source_file=source_name,
+    )
+
+    _print_summary(summary)
+
+    if args.output_dir:
+        stem = json_path.stem.removesuffix("_transcript").removesuffix("_transcription")
+        out_path = summarizer.save(
+            summary=summary,
+            output_dir=args.output_dir,
+            stem=stem,
+            fmt=args.summary_format,
+        )
+        logger.info("Summary saved: %s", out_path)
+
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -241,10 +387,15 @@ def main() -> int:
     if args.vram_check:
         return cmd_vram_check()
 
+    # --- Summarize-only mode (no GPU / transcription) ---
+    if args.summarize_only:
+        return cmd_summarize_only(args, logger)
+
     # --- Require an input ---
     if args.input is None and args.batch is None:
         parser.print_help()
-        print("\nError: Specify --input FILE or --batch FOLDER.")
+        print("\nError: Specify --input FILE, --batch FOLDER, "
+              "--summarize-only JSON_FILE, or --vram-check.")
         return 1
 
     # --- Build transcriber ---
@@ -284,6 +435,10 @@ def main() -> int:
             save_json=save_json,
         )
         transcriber.formatter.print_to_console(result)
+
+        if args.summarize:
+            _run_summarization(result, args, logger)
+
         return 0
 
     # --- Batch folder mode ---
@@ -302,6 +457,8 @@ def main() -> int:
         print(f"\nBatch complete — processed {len(results)} file(s).")
         for result in results:
             transcriber.formatter.print_to_console(result)
+            if args.summarize:
+                _run_summarization(result, args, logger)
 
         return 0
 

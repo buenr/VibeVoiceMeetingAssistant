@@ -30,6 +30,11 @@ huggingface-hub>=0.24.0
 librosa>=0.10.0
 soundfile>=0.12.1
 
+# --- Gemini 2.5 Flash Lite summarization (google-genai SDK) ---
+# Required only for --summarize / --summarize-only.
+# Get a free API key at: https://aistudio.google.com/apikey
+google-genai>=1.0.0
+
 # --- CLI output ---
 rich>=13.0.0
 
