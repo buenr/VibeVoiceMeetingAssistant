@@ -1,0 +1,42 @@
+# ============================================================
+# requirements.txt — VibeVoice Meeting Transcription App
+# Windows + NVIDIA CUDA (RTX 3060 12 GB VRAM)
+# ============================================================
+#
+# IMPORTANT: Install PyTorch with CUDA FIRST (before this file):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+# Then install vibevoice from GitHub:
+#   pip install git+https://github.com/microsoft/VibeVoice.git
+#
+# Then install this file:
+#   pip install -r requirements.txt
+#
+# flash-attn is OPTIONAL on Windows (skip if build fails):
+#   pip install flash-attn --no-build-isolation
+# ============================================================
+
+# --- 4-bit quantization kernels (0.44+ has native Windows support) ---
+bitsandbytes>=0.44.0
+
+# --- Core ML / HuggingFace stack ---
+# transformers <5.0 required: VibeVoice uses custom modeling code
+# not yet in transformers v5 (tokenization_qwen2_fast removal)
+transformers>=4.45.0,<5.0.0
+accelerate>=0.34.0
+huggingface-hub>=0.24.0
+
+# --- Audio loading and resampling ---
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# --- Gemini 2.5 Flash Lite summarization (google-genai SDK) ---
+# Required only for --summarize / --summarize-only.
+# Get a free API key at: https://aistudio.google.com/apikey
+google-genai>=1.0.0
+
+# --- CLI output ---
+rich>=13.0.0
+
+# --- Utilities ---
+numpy>=1.24.0
